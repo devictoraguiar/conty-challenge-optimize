@@ -1,8 +1,8 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import type { DatabaseSync } from "node:sqlite";
 import { createApp } from "../src/app.ts";
 import { deliveriesSince } from "../src/clock.ts";
-import { openDatabase } from "../src/db.ts";
+import { getQueryCount, openDatabase, resetQueryCount } from "../src/db.ts";
 import { CAMPAIGN_ID, seed } from "../src/seed.ts";
 
 type Match = {
@@ -12,6 +12,18 @@ type Match = {
   latest_reach: number;
   deliveries_90d: number;
 };
+
+const databases: DatabaseSync[] = [];
+
+function trackedDatabase(): DatabaseSync {
+  const db = openDatabase(":memory:");
+  databases.push(db);
+  return db;
+}
+
+afterEach(() => {
+  for (const db of databases.splice(0)) db.close();
+});
 
 function originalList(
   db: DatabaseSync,
@@ -78,7 +90,7 @@ function originalList(
 
 describe("equivalência da listagem em volume alto", () => {
   it("preserva conteúdo, ordenação e limites do algoritmo original acima do seed", async () => {
-    const db = openDatabase(":memory:");
+    const db = trackedDatabase();
     seed(db, { creators: 2000, seed: 7 });
     const app = createApp(db);
 
@@ -90,17 +102,19 @@ describe("equivalência da listagem em volume alto", () => {
       { limit: 20, offset: 5000 },
     ]) {
       const expected = originalList(db, { campaignId: CAMPAIGN_ID, limit, offset });
+      resetQueryCount();
       const response = await app.request(
         `/campaigns/${CAMPAIGN_ID}/creators?limit=${limit}&offset=${offset}`,
       );
 
       expect(response.status).toBe(200);
+      expect(getQueryCount()).toBeLessThanOrEqual(8);
       expect(await response.json()).toEqual(expected);
     }
   });
 
   it("soma alcances acima do inteiro seguro no JavaScript, conta por conta", async () => {
-    const db = openDatabase(":memory:");
+    const db = trackedDatabase();
     db.exec(`
       INSERT INTO campaigns VALUES ('cmp_large', 'Alcance grande', '["beleza"]');
       INSERT INTO creators VALUES ('crt_large', 'Criador grande', '["beleza"]', '');
@@ -119,5 +133,28 @@ describe("equivalência da listagem em volume alto", () => {
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual(expected);
     expect(expected?.creators[0]?.latest_reach).toBe(18_014_398_509_481_982);
+  });
+
+  it("não lê alcance inteiro fora do nicho compatível", async () => {
+    const db = trackedDatabase();
+    db.exec(`
+      INSERT INTO campaigns VALUES ('cmp_filter', 'Filtro', '["beleza"]');
+      INSERT INTO creators VALUES
+        ('crt_compatible', 'Compatível', '["beleza"]', ''),
+        ('crt_outside', 'Fora do nicho', '["games"]', '');
+      INSERT INTO social_accounts VALUES
+        ('acc_compatible', 'crt_compatible', 'instagram'),
+        ('acc_outside', 'crt_outside', 'instagram');
+      INSERT INTO metrics VALUES
+        ('met_compatible', 'acc_compatible', 200, '2026-05-31T00:00:00.000Z', ''),
+        ('met_outside', 'acc_outside', 9223372036854775807, '2026-05-31T00:00:00.000Z', '');
+    `);
+    const app = createApp(db);
+    const expected = originalList(db, { campaignId: "cmp_filter", limit: 20, offset: 0 });
+
+    const response = await app.request("/campaigns/cmp_filter/creators");
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual(expected);
   });
 });
